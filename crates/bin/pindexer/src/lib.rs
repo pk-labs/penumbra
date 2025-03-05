@@ -12,6 +12,7 @@ pub mod stake;
 pub mod supply;
 
 pub mod governance;
+pub mod explorer;
 
 #[derive(clap::Parser, Clone, Debug)]
 pub struct Options {
