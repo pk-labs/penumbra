@@ -5,9 +5,10 @@ use cometindex::{
 use penumbra_sdk_proto::{
     core::{
         component::sct::v1 as pb,
-        transaction::v1::Transaction,
+        transaction::v1::{Transaction, TransactionView},
     },
     event::ProtoEvent,
+    util::tendermint_proxy::v1::GetTxResponse,
 };
 use prost::Message;
 use sqlx::types::chrono::DateTime;
@@ -167,10 +168,20 @@ impl AppView for BlockDetails {
                         .execute(dbtx.as_mut())
                         .await?;
 
-                    for (tx_hash, tx_bytes) in block.transactions() {
+                    sqlx::query("CREATE INDEX IF NOT EXISTS idx_explorer_transactions_tx_hash ON explorer_transactions(tx_hash);")
+                        .execute(dbtx.as_mut())
+                        .await?;
+                    sqlx::query("CREATE INDEX IF NOT EXISTS idx_explorer_transactions_block_height ON explorer_transactions(block_height);")
+                        .execute(dbtx.as_mut())
+                        .await?;
+                    sqlx::query("CREATE INDEX IF NOT EXISTS idx_explorer_transactions_timestamp ON explorer_transactions(timestamp DESC);")
+                        .execute(dbtx.as_mut())
+                        .await?;
+
+                    for (tx_index, (tx_hash, tx_bytes)) in block.transactions().enumerate() {
                         println!("Inserting transaction with hash {:?} from block {}", tx_hash, height);
 
-                        let decoded_tx_json = create_transaction_json(tx_hash, tx_bytes, height, ts);
+                        let decoded_tx_json = create_transaction_json(tx_hash, tx_bytes, height, ts, tx_index as u64);
 
                         let insert_result = sqlx::query(
                             "
@@ -235,10 +246,10 @@ impl AppView for Transactions {
 
             let block_time = timestamp.unwrap();
 
-            for (tx_hash, tx_bytes) in block.transactions() {
+            for (tx_index, (tx_hash, tx_bytes)) in block.transactions().enumerate() {
                 println!("Transactions AppView: Inserting transaction with hash {:?} from block {}", tx_hash, height);
 
-                let decoded_tx_json = create_transaction_json(tx_hash, tx_bytes, height, block_time);
+                let decoded_tx_json = create_transaction_json(tx_hash, tx_bytes, height, block_time, tx_index as u64);
 
                 let result = sqlx::query(
                     "
@@ -301,38 +312,48 @@ fn create_transaction_json(
     tx_hash: [u8; 32],
     tx_bytes: &[u8],
     height: u64,
-    timestamp: DateTime<sqlx::types::chrono::Utc>
+    timestamp: DateTime<sqlx::types::chrono::Utc>,
+    tx_index: u64,
 ) -> Value {
-    let tx_raw_hex = encode_to_hex(tx_bytes);
+    let get_tx_response = GetTxResponse {
+        hash: tx_hash.to_vec(),
+        height,
+        index: tx_index,
+        tx_result: None,
+        tx: tx_bytes.to_vec(),
+    };
 
-    let decoded_transaction = match Transaction::decode(tx_bytes) {
-        Ok(tx) => {
-            let tx_json = serde_json::to_value(&tx)
-                .unwrap_or_else(|_| json!({"decode_error": "Failed to convert transaction to JSON"}));
-
-            json!({
-                "transaction": {
-                    "hash": encode_to_hex(tx_hash),
-                    "block_height": height,
-                    "timestamp": timestamp,
-                    "raw_data_hex": tx_raw_hex,
-                    "decoded_tx": tx_json
-                }
-            })
+    let tx_result_decoded = match TransactionView::decode(tx_bytes) {
+        Ok(tx_view) => {
+            serde_json::to_value(&tx_view).unwrap_or(json!({}))
         },
-        Err(_) => {
-            json!({
-                "transaction": {
-                    "hash": encode_to_hex(tx_hash),
-                    "block_height": height,
-                    "timestamp": timestamp,
-                    "raw_data_hex": tx_raw_hex
+        Err(e) => {
+            println!("Error decoding transaction with hash {:?} using TransactionView: {:?}",
+                     encode_to_hex(tx_hash), e);
+
+            match Transaction::decode(tx_bytes) {
+                Ok(tx) => {
+                    println!("Successfully decoded transaction with hash {:?} using Transaction",
+                             encode_to_hex(tx_hash));
+                    serde_json::to_value(&tx).unwrap_or(json!({}))
+                },
+                Err(e2) => {
+                    println!("Error decoding transaction with hash {:?} using Transaction: {:?}",
+                             encode_to_hex(tx_hash), e2);
+                    json!({})
                 }
-            })
+            }
         }
     };
 
-    decoded_transaction
+    json!({
+        "hash": encode_to_hex(tx_hash),
+        "height": height.to_string(),
+        "index": tx_index.to_string(),
+        "timestamp": timestamp,
+        "tx_result": encode_to_hex(tx_bytes),
+        "tx_result_decoded": tx_result_decoded
+    })
 }
 
 fn event_to_json(event: ContextualizedEvent<'_>, tx_hash: Option<[u8; 32]>) -> Result<Value, anyhow::Error> {
