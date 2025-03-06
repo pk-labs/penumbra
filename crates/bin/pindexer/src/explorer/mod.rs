@@ -14,6 +14,7 @@ use prost::Message;
 use sqlx::types::chrono::DateTime;
 use serde_json::{json, Value};
 use std::fmt::Write;
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct BlockDetails {}
@@ -77,6 +78,8 @@ impl AppView for BlockDetails {
             let mut block_events = Vec::new();
             let mut tx_events = Vec::new();
 
+            let mut events_by_tx_hash: HashMap<[u8; 32], Vec<ContextualizedEvent>> = HashMap::new();
+
             for event in block.events() {
                 if let Ok(pe) = pb::EventBlockRoot::from_event(&event.event) {
                     let timestamp_proto = pe.timestamp.unwrap_or_default();
@@ -88,6 +91,7 @@ impl AppView for BlockDetails {
                 }
 
                 if let Some(tx_hash) = event.tx_hash() {
+                    events_by_tx_hash.entry(tx_hash).or_default().push(event.clone());
                     tx_events.push(event_to_json(event, Some(tx_hash))?);
                 } else {
                     block_events.push(event_to_json(event, None)?);
@@ -181,7 +185,16 @@ impl AppView for BlockDetails {
                     for (tx_index, (tx_hash, tx_bytes)) in block.transactions().enumerate() {
                         println!("Inserting transaction with hash {:?} from block {}", tx_hash, height);
 
-                        let decoded_tx_json = create_transaction_json(tx_hash, tx_bytes, height, ts, tx_index as u64);
+                        let tx_events = events_by_tx_hash.get(&tx_hash).cloned().unwrap_or_default();
+
+                        let decoded_tx_json = create_transaction_json(
+                            tx_hash,
+                            tx_bytes,
+                            height,
+                            ts,
+                            tx_index as u64,
+                            &tx_events
+                        );
 
                         let insert_result = sqlx::query(
                             "
@@ -246,10 +259,27 @@ impl AppView for Transactions {
 
             let block_time = timestamp.unwrap();
 
+            let mut events_by_tx_hash: HashMap<[u8; 32], Vec<ContextualizedEvent>> = HashMap::new();
+
+            for event in block.events() {
+                if let Some(tx_hash) = event.tx_hash() {
+                    events_by_tx_hash.entry(tx_hash).or_default().push(event.clone());
+                }
+            }
+
             for (tx_index, (tx_hash, tx_bytes)) in block.transactions().enumerate() {
                 println!("Transactions AppView: Inserting transaction with hash {:?} from block {}", tx_hash, height);
 
-                let decoded_tx_json = create_transaction_json(tx_hash, tx_bytes, height, block_time, tx_index as u64);
+                let tx_events = events_by_tx_hash.get(&tx_hash).cloned().unwrap_or_default();
+
+                let decoded_tx_json = create_transaction_json(
+                    tx_hash,
+                    tx_bytes,
+                    height,
+                    block_time,
+                    tx_index as u64,
+                    &tx_events
+                );
 
                 let result = sqlx::query(
                     "
@@ -314,6 +344,7 @@ fn create_transaction_json(
     height: u64,
     timestamp: DateTime<sqlx::types::chrono::Utc>,
     tx_index: u64,
+    tx_events: &[ContextualizedEvent<'_>],
 ) -> Value {
     let get_tx_response = GetTxResponse {
         hash: tx_hash.to_vec(),
@@ -346,14 +377,78 @@ fn create_transaction_json(
         }
     };
 
-    json!({
-        "hash": encode_to_hex(tx_hash),
-        "height": height.to_string(),
-        "index": tx_index.to_string(),
-        "timestamp": timestamp,
-        "tx_result": encode_to_hex(tx_bytes),
-        "tx_result_decoded": tx_result_decoded
-    })
+    let mut processed_events = Vec::new();
+
+    processed_events.push(json!({
+        "type": "tx",
+        "attributes": [
+            {"key": "hash", "value": encode_to_hex(tx_hash)},
+            {"key": "height", "value": height.to_string()}
+        ]
+    }));
+
+    for event in tx_events {
+        let mut attributes = Vec::new();
+
+        for attr in &event.event.attributes {
+            let attr_str = format!("{:?}", attr);
+
+            if let Some((key, value)) = parse_attribute_string(&attr_str) {
+                attributes.push(json!({
+                    "key": key,
+                    "value": value
+                }));
+            } else {
+                attributes.push(json!({
+                    "key": attr_str,
+                    "value": "Unknown"
+                }));
+            }
+        }
+
+        processed_events.push(json!({
+            "type": event.event.kind,
+            "attributes": attributes
+        }));
+    }
+
+    let mut ordered_json = serde_json::Map::new();
+    ordered_json.insert("hash".to_string(), json!(encode_to_hex(tx_hash)));
+    ordered_json.insert("height".to_string(), json!(height.to_string()));
+    ordered_json.insert("index".to_string(), json!(tx_index.to_string()));
+    ordered_json.insert("timestamp".to_string(), json!(timestamp));
+    ordered_json.insert("tx_result".to_string(), json!(encode_to_hex(tx_bytes)));
+    ordered_json.insert("tx_result_decoded".to_string(), json!(tx_result_decoded));
+    ordered_json.insert("events".to_string(), json!(processed_events));
+
+    Value::Object(ordered_json)
+}
+
+
+fn parse_attribute_string(attr_str: &str) -> Option<(String, String)> {
+    if attr_str.contains("key:") && attr_str.contains("value:") {
+        let key_start = attr_str.find("key:").unwrap_or(0) + 4;
+        let key_end = attr_str[key_start..].find(",").map(|pos| key_start + pos).unwrap_or(attr_str.len());
+        let key = attr_str[key_start..key_end].trim().trim_matches('"').to_string();
+
+        let value_start = attr_str.find("value:").unwrap_or(0) + 6;
+        let value_end = attr_str[value_start..].find(",").map(|pos| value_start + pos).unwrap_or(attr_str.len());
+        let value = attr_str[value_start..value_end].trim().trim_matches('"').to_string();
+
+        return Some((key, value));
+    }
+
+    if attr_str.contains('{') && attr_str.contains('}') {
+        let json_start = attr_str.find('{').unwrap_or(0);
+        let field_name = attr_str[0..json_start].trim().to_string();
+
+        if !field_name.is_empty() {
+            let json_content = &attr_str[json_start..];
+            return Some((field_name, json_content.to_string()));
+        }
+    }
+
+    None
 }
 
 fn event_to_json(event: ContextualizedEvent<'_>, tx_hash: Option<[u8; 32]>) -> Result<Value, anyhow::Error> {
