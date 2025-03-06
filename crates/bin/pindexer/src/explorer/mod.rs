@@ -87,10 +87,8 @@ impl AppView for BlockDetails {
                 }
 
                 if let Some(tx_hash) = event.tx_hash() {
-                    // This is a transaction event
                     tx_events.push(event_to_json(event, Some(tx_hash))?);
                 } else {
-                    // This is a block event
                     block_events.push(event_to_json(event, None)?);
                 }
             }
@@ -299,18 +297,26 @@ impl Transactions {
     }
 }
 
-fn create_transaction_json(tx_hash: [u8; 32], tx_bytes: &[u8], height: u64, timestamp: DateTime<sqlx::types::chrono::Utc>) -> Value {
-    let decoded = match Transaction::decode(tx_bytes) {
+fn create_transaction_json(
+    tx_hash: [u8; 32],
+    tx_bytes: &[u8],
+    height: u64,
+    timestamp: DateTime<sqlx::types::chrono::Utc>
+) -> Value {
+    let tx_raw_hex = encode_to_hex(tx_bytes);
+
+    let decoded_transaction = match Transaction::decode(tx_bytes) {
         Ok(tx) => {
-            let tx_debug = format!("{:?}", tx);
+            let tx_json = serde_json::to_value(&tx)
+                .unwrap_or_else(|_| json!({"decode_error": "Failed to convert transaction to JSON"}));
 
             json!({
                 "transaction": {
                     "hash": encode_to_hex(tx_hash),
                     "block_height": height,
                     "timestamp": timestamp,
-                    "raw_data_hex": encode_to_hex(tx_bytes),
-                    "decoded": tx_debug
+                    "raw_data_hex": tx_raw_hex,
+                    "decoded_tx": tx_json
                 }
             })
         },
@@ -320,16 +326,15 @@ fn create_transaction_json(tx_hash: [u8; 32], tx_bytes: &[u8], height: u64, time
                     "hash": encode_to_hex(tx_hash),
                     "block_height": height,
                     "timestamp": timestamp,
-                    "raw_data_hex": encode_to_hex(tx_bytes)
+                    "raw_data_hex": tx_raw_hex
                 }
             })
         }
     };
 
-    decoded
+    decoded_transaction
 }
 
-// Helper function to convert event to JSON
 fn event_to_json(event: ContextualizedEvent<'_>, tx_hash: Option<[u8; 32]>) -> Result<Value, anyhow::Error> {
     let mut attributes = Vec::new();
 
