@@ -19,6 +19,7 @@ network-integration = []
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+tendermint = { version = "0.34" }
 anyhow = {workspace = true}
 clap = {workspace = true}
 chrono = {workspace = true, features = ["serde"] }

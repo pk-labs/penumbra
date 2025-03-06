@@ -6121,6 +6121,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tendermint 0.34.1",
  "tokio",
  "tracing",
  "url",

@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS explorer_block_details (
                                                       total_fees NUMERIC(39, 0) DEFAULT 0,
     validator_identity_key TEXT,
     previous_block_hash BYTEA,
-    block_hash BYTEA
+    block_hash BYTEA,
+    raw_json JSONB
     );
 
 -- Indices for efficient querying of the blocks table
@@ -21,6 +22,7 @@ CREATE TABLE IF NOT EXISTS explorer_transactions (
                                                      block_height BIGINT NOT NULL,
                                                      timestamp TIMESTAMPTZ NOT NULL,
                                                      raw_data BYTEA,
+                                                     raw_json JSONB,
                                                      FOREIGN KEY (block_height) REFERENCES explorer_block_details(height)
     );
 
@@ -38,7 +40,8 @@ SELECT
     timestamp,
     num_transactions,
     total_fees,
-    validator_identity_key
+    validator_identity_key,
+    raw_json
 FROM
     explorer_block_details
 ORDER BY
@@ -50,13 +53,8 @@ SELECT
     t.tx_hash,
     t.block_height,
     t.timestamp,
-    t.fee,
-    t.transaction_type,
-    t.status,
-    COUNT(a.id) AS action_count
+    t.raw_json
 FROM
     explorer_transactions t
-        LEFT JOIN
-    explorer_transaction_actions a ON t.tx_hash = a.tx_hash
-GROUP BY
-    t.tx_hash, t.block_height, t.timestamp, t.fee, t.transaction_type, t.status;
+ORDER BY
+    t.timestamp DESC;

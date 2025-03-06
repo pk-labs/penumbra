@@ -1,9 +1,18 @@
 use anyhow::Result;
 use cometindex::{
-    async_trait, index::EventBatch, sqlx, AppView, PgTransaction,
+    async_trait, index::EventBatch, sqlx, AppView, ContextualizedEvent, PgTransaction,
 };
-use penumbra_sdk_proto::{core::component::sct::v1 as pb, event::ProtoEvent};
+use penumbra_sdk_proto::{
+    core::{
+        component::sct::v1 as pb,
+        transaction::v1::Transaction,
+    },
+    event::ProtoEvent,
+};
+use prost::Message;
 use sqlx::types::chrono::DateTime;
+use serde_json::{json, Value};
+use std::fmt::Write;
 
 #[derive(Debug)]
 pub struct BlockDetails {}
@@ -32,7 +41,8 @@ impl AppView for BlockDetails {
                 total_fees NUMERIC(39, 0) DEFAULT 0,
                 validator_identity_key TEXT,
                 previous_block_hash BYTEA,
-                block_hash BaYTEA
+                block_hash BYTEA,
+                raw_json JSONB
             );
             "
         )
@@ -59,8 +69,12 @@ impl AppView for BlockDetails {
             let mut block_root = None;
             let mut timestamp = None;
             let tx_count = block.transactions().count();
+            let height = block.height();
 
-            println!("Processing block height {} with {} transactions", block.height(), tx_count);
+            println!("Processing block height {} with {} transactions", height, tx_count);
+
+            let mut block_events = Vec::new();
+            let mut tx_events = Vec::new();
 
             for event in block.events() {
                 if let Ok(pe) = pb::EventBlockRoot::from_event(&event.event) {
@@ -70,12 +84,44 @@ impl AppView for BlockDetails {
                         u32::try_from(timestamp_proto.nanos)?,
                     );
                     block_root = Some(pe.root.unwrap().inner);
-                    break;
+                }
+
+                if let Some(tx_hash) = event.tx_hash() {
+                    // This is a transaction event
+                    tx_events.push(event_to_json(event, Some(tx_hash))?);
+                } else {
+                    // This is a block event
+                    block_events.push(event_to_json(event, None)?);
                 }
             }
 
+            let transactions: Vec<Value> = block.transactions()
+                .enumerate()
+                .map(|(index, (tx_hash, _))| {
+                    json!({
+                        "block_id": height,
+                        "index": index,
+                        "created_at": timestamp,
+                        "tx_hash": encode_to_hex(tx_hash)
+                    })
+                })
+                .collect();
+
+            let mut all_events = Vec::new();
+            all_events.extend(block_events);
+            all_events.extend(tx_events);
+
+            let raw_json = json!({
+                "block": {
+                    "height": height,
+                    "chain_id": "penumbra-1",
+                    "created_at": timestamp,
+                    "transactions": transactions,
+                    "events": all_events
+                }
+            });
+
             if let (Some(root), Some(ts)) = (block_root, timestamp) {
-                let height = block.height();
                 let validator_key = None::<String>;
                 let previous_hash = None::<Vec<u8>>;
                 let block_hash = None::<Vec<u8>>;
@@ -83,15 +129,16 @@ impl AppView for BlockDetails {
                 sqlx::query(
                     "
                 INSERT INTO explorer_block_details
-                (height, root, timestamp, num_transactions, validator_identity_key, previous_block_hash, block_hash)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (height, root, timestamp, num_transactions, validator_identity_key, previous_block_hash, block_hash, raw_json)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (height) DO UPDATE SET
                 root = EXCLUDED.root,
                 timestamp = EXCLUDED.timestamp,
                 num_transactions = EXCLUDED.num_transactions,
                 validator_identity_key = EXCLUDED.validator_identity_key,
                 previous_block_hash = EXCLUDED.previous_block_hash,
-                block_hash = EXCLUDED.block_hash
+                block_hash = EXCLUDED.block_hash,
+                raw_json = EXCLUDED.raw_json
                 "
                 )
                     .bind(i64::try_from(height)?)
@@ -101,6 +148,7 @@ impl AppView for BlockDetails {
                     .bind(validator_key)
                     .bind(previous_hash)
                     .bind(block_hash)
+                    .bind(raw_json)
                     .execute(dbtx.as_mut())
                     .await?;
 
@@ -113,6 +161,7 @@ impl AppView for BlockDetails {
                         block_height BIGINT NOT NULL,
                         timestamp TIMESTAMPTZ NOT NULL,
                         raw_data BYTEA,
+                        raw_json JSONB,
                         FOREIGN KEY (block_height) REFERENCES explorer_block_details(height)
                     );
                     "
@@ -123,11 +172,13 @@ impl AppView for BlockDetails {
                     for (tx_hash, tx_bytes) in block.transactions() {
                         println!("Inserting transaction with hash {:?} from block {}", tx_hash, height);
 
+                        let decoded_tx_json = create_transaction_json(tx_hash, tx_bytes, height, ts);
+
                         let insert_result = sqlx::query(
                             "
                         INSERT INTO explorer_transactions
-                        (tx_hash, block_height, timestamp, raw_data)
-                        VALUES ($1, $2, $3, $4)
+                        (tx_hash, block_height, timestamp, raw_data, raw_json)
+                        VALUES ($1, $2, $3, $4, $5)
                         ON CONFLICT (tx_hash) DO NOTHING
                         "
                         )
@@ -135,6 +186,7 @@ impl AppView for BlockDetails {
                             .bind(i64::try_from(height)?)
                             .bind(ts)
                             .bind(tx_bytes)
+                            .bind(decoded_tx_json)
                             .execute(dbtx.as_mut())
                             .await;
 
@@ -149,7 +201,7 @@ impl AppView for BlockDetails {
 
         Ok(())
     }
-    }
+}
 
 #[async_trait]
 impl AppView for Transactions {
@@ -159,36 +211,9 @@ impl AppView for Transactions {
 
     async fn init_chain(
         &self,
-        dbtx: &mut PgTransaction,
+        _dbtx: &mut PgTransaction,
         _: &serde_json::Value,
     ) -> Result<(), anyhow::Error> {
-        sqlx::query(
-            "
-            CREATE TABLE IF NOT EXISTS explorer_transactions (
-                id SERIAL PRIMARY KEY,
-                tx_hash BYTEA NOT NULL UNIQUE,
-                block_height BIGINT NOT NULL,
-                timestamp TIMESTAMPTZ NOT NULL,
-                raw_data BYTEA,
-                FOREIGN KEY (block_height) REFERENCES explorer_block_details(height)
-            );
-            "
-        )
-            .execute(dbtx.as_mut())
-            .await?;
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_explorer_transactions_tx_hash ON explorer_transactions(tx_hash);")
-            .execute(dbtx.as_mut())
-            .await?;
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_explorer_transactions_block_height ON explorer_transactions(block_height);")
-            .execute(dbtx.as_mut())
-            .await?;
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_explorer_transactions_timestamp ON explorer_transactions(timestamp DESC);")
-            .execute(dbtx.as_mut())
-            .await?;
-
         Ok(())
     }
 
@@ -215,18 +240,25 @@ impl AppView for Transactions {
             for (tx_hash, tx_bytes) in block.transactions() {
                 println!("Transactions AppView: Inserting transaction with hash {:?} from block {}", tx_hash, height);
 
+                let decoded_tx_json = create_transaction_json(tx_hash, tx_bytes, height, block_time);
+
                 let result = sqlx::query(
                     "
                     INSERT INTO explorer_transactions
-                    (tx_hash, block_height, timestamp, raw_data)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (tx_hash) DO NOTHING
+                    (tx_hash, block_height, timestamp, raw_data, raw_json)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (tx_hash) DO UPDATE SET
+                    block_height = EXCLUDED.block_height,
+                    timestamp = EXCLUDED.timestamp,
+                    raw_data = EXCLUDED.raw_data,
+                    raw_json = EXCLUDED.raw_json
                     "
                 )
                     .bind(tx_hash.as_ref())
                     .bind(i64::try_from(height)?)
                     .bind(block_time)
                     .bind(tx_bytes)
+                    .bind(decoded_tx_json)
                     .execute(dbtx.as_mut())
                     .await;
 
@@ -265,6 +297,71 @@ impl Transactions {
 
         Ok(timestamp)
     }
+}
+
+fn create_transaction_json(tx_hash: [u8; 32], tx_bytes: &[u8], height: u64, timestamp: DateTime<sqlx::types::chrono::Utc>) -> Value {
+    let decoded = match Transaction::decode(tx_bytes) {
+        Ok(tx) => {
+            let tx_debug = format!("{:?}", tx);
+
+            json!({
+                "transaction": {
+                    "hash": encode_to_hex(tx_hash),
+                    "block_height": height,
+                    "timestamp": timestamp,
+                    "raw_data_hex": encode_to_hex(tx_bytes),
+                    "decoded": tx_debug
+                }
+            })
+        },
+        Err(_) => {
+            json!({
+                "transaction": {
+                    "hash": encode_to_hex(tx_hash),
+                    "block_height": height,
+                    "timestamp": timestamp,
+                    "raw_data_hex": encode_to_hex(tx_bytes)
+                }
+            })
+        }
+    };
+
+    decoded
+}
+
+// Helper function to convert event to JSON
+fn event_to_json(event: ContextualizedEvent<'_>, tx_hash: Option<[u8; 32]>) -> Result<Value, anyhow::Error> {
+    let mut attributes = Vec::new();
+
+    for attr in &event.event.attributes {
+        let attr_str = format!("{:?}", attr);
+
+        attributes.push(json!({
+            "key": attr_str.clone(),
+            "composite_key": format!("{}.{}", event.event.kind, attr_str),
+            "value": "Unknown"
+        }));
+    }
+
+    let json_event = json!({
+        "block_id": event.block_height,
+        "tx_id": tx_hash.map(encode_to_hex),
+        "type": event.event.kind,
+        "attributes": attributes
+    });
+
+    Ok(json_event)
+}
+
+fn encode_to_hex<T: AsRef<[u8]>>(data: T) -> String {
+    let bytes = data.as_ref();
+    let mut hex_string = String::with_capacity(bytes.len() * 2);
+
+    for &byte in bytes {
+        let _ = write!(&mut hex_string, "{:02X}", byte);
+    }
+
+    hex_string
 }
 
 pub fn app_views() -> Vec<Box<dyn AppView>> {
